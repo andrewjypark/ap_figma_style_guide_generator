@@ -84,7 +84,7 @@
 // use IBM Plex Mono / IBM Plex Sans as their primary — swapped in from
 // Montserrat / League Gothic) fall back to Open Sans instead.
 
-figma.showUI(__html__, { width: 340, height: 460 });
+figma.showUI(__html__, { width: 360, height: 520 });
 
 const SECTION_GAP = 450; // horizontal gap between multiple collection Sections
 const MARGIN = 100; // margin between a Section's edge and its content frame
@@ -1057,14 +1057,26 @@ async function buildOutputSection(sectionLabel, headerTitle, headerDescription, 
 // TOP-LEVEL GENERATION
 // ---------------------------------------------------------------------
 
-async function generateForCollectionMode(collection, modeId, modeName, xCursor, outputPage) {
+async function generateForCollectionMode(collection, modeId, modeName, xCursor, outputPage, selectedGroupLabels) {
   const allVars = [];
   for (const id of collection.variableIds) {
     allVars.push(await figma.variables.getVariableByIdAsync(id));
   }
 
-  const colorGroups = discoverColorGroups(allVars, modeId);
-  const tokenGroups = discoverTokenGroups(allVars);
+  // selectedGroupLabels is the set of "labelParts.join(' / ')" strings the
+  // UI's checkbox tree left checked for this collection — null means no
+  // filtering (every group renders), matching the old whole-collection
+  // behavior. Filtering happens here, after discovery, so sibling matching
+  // downstream (buildTokenSiblingIndex / computeConsumedSiblingIds) still
+  // sees every variable in the collection regardless of what's selected —
+  // deselecting "Line height" shouldn't degrade a still-selected "Font
+  // Size" style's composed sample, which needs that sibling's value.
+  const colorGroups = discoverColorGroups(allVars, modeId).filter(
+    (g) => !selectedGroupLabels || selectedGroupLabels.has(g.labelParts.join(" / "))
+  );
+  const tokenGroups = discoverTokenGroups(allVars).filter(
+    (g) => !selectedGroupLabels || selectedGroupLabels.has(g.labelParts.join(" / "))
+  );
 
   const created = [];
   const baseLabel = modeName ? collection.name + " — " + modeName : collection.name;
@@ -1117,7 +1129,10 @@ async function generateForCollectionMode(collection, modeId, modeName, xCursor, 
   return { created, xCursor };
 }
 
-async function generateSelected(collectionNames) {
+// `selection` is { [collectionName]: string[] of selected group labels },
+// exactly the shape the UI's checkbox tree sends — a collection missing
+// from it, or present with an empty array, is skipped entirely.
+async function generateSelected(selection) {
   let outputPage = figma.root.children.find((p) => p.name === "Style Guide");
   if (!outputPage) {
     outputPage = figma.createPage();
@@ -1126,23 +1141,30 @@ async function generateSelected(collectionNames) {
   await outputPage.loadAsync();
   await figma.setCurrentPageAsync(outputPage);
 
-  const orderedNames = [...collectionNames].sort(compareCollections);
+  const orderedNames = Object.keys(selection).sort(compareCollections);
   const allCollections = await figma.variables.getLocalVariableCollectionsAsync();
 
   let xCursor = 0;
   const createdSections = [];
   for (const name of orderedNames) {
+    const groupLabels = selection[name];
+    if (!groupLabels || !groupLabels.length) continue;
     const collection = allCollections.find((c) => c.name === name);
     if (!collection) continue;
+    const selectedGroupLabels = new Set(groupLabels);
     const modes = collection.modes;
 
     if (modes.length <= 1) {
-      const { created, xCursor: next } = await generateForCollectionMode(collection, modes[0].modeId, null, xCursor, outputPage);
+      const { created, xCursor: next } = await generateForCollectionMode(
+        collection, modes[0].modeId, null, xCursor, outputPage, selectedGroupLabels
+      );
       createdSections.push(...created);
       xCursor = next;
     } else {
       for (const mode of modes) {
-        const { created, xCursor: next } = await generateForCollectionMode(collection, mode.modeId, mode.name, xCursor, outputPage);
+        const { created, xCursor: next } = await generateForCollectionMode(
+          collection, mode.modeId, mode.name, xCursor, outputPage, selectedGroupLabels
+        );
         createdSections.push(...created);
         xCursor = next;
       }
@@ -1157,28 +1179,49 @@ async function generateSelected(collectionNames) {
   return { sectionCount: createdSections.length };
 }
 
-// Every local collection, regardless of naming convention — the whole
-// point of this rewrite is that nothing here filters by variable name.
-async function listCollections() {
+// Builds the tree the UI's checkbox picker is drawn from: one row per
+// local variable collection (regardless of naming convention — nothing
+// here filters by variable name), with a nested row per group it would
+// actually produce a Section for, using the exact same discovery
+// generation itself runs — so a group a user sees (and can leave
+// unchecked) here is precisely one they can leave out of the output.
+// Uses each collection's first mode only to decide the group shape:
+// grouping comes from variable names, not resolved values, so it doesn't
+// meaningfully vary by mode.
+async function listCollectionTree() {
   const collections = await figma.variables.getLocalVariableCollectionsAsync();
-  return collections.map((c) => c.name).sort(compareCollections);
+  const ordered = [...collections].sort((a, b) => compareCollections(a.name, b.name));
+  const tree = [];
+  for (const collection of ordered) {
+    const allVars = [];
+    for (const id of collection.variableIds) {
+      allVars.push(await figma.variables.getVariableByIdAsync(id));
+    }
+    const modeId = collection.modes[0].modeId;
+    const colorGroups = discoverColorGroups(allVars, modeId).map((g) => g.labelParts.join(" / "));
+    const tokenGroups = discoverTokenGroups(allVars).map((g) => g.labelParts.join(" / "));
+    const groups = [...new Set([...colorGroups, ...tokenGroups])];
+    tree.push({ name: collection.name, groups });
+  }
+  return tree;
 }
 
 figma.ui.onmessage = async (msg) => {
   if (msg.type === "ui-ready") {
     try {
-      const names = await listCollections();
-      figma.ui.postMessage({ type: "collections", names });
+      const collections = await listCollectionTree();
+      figma.ui.postMessage({ type: "tree", collections });
     } catch (err) {
       figma.ui.postMessage({ type: "error", message: err.message });
     }
   } else if (msg.type === "generate") {
-    if (!msg.collectionNames || !msg.collectionNames.length) {
+    const hasAnySelection = msg.selection && Object.values(msg.selection).some((groups) => groups && groups.length);
+    if (!hasAnySelection) {
       figma.ui.postMessage({ type: "error", message: "Select at least one collection." });
       return;
     }
     try {
-      const result = await generateSelected(msg.collectionNames);
+      const result = await generateSelected(msg.selection);
       figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on the Style Guide page." });
     } catch (err) {
       figma.ui.postMessage({ type: "error", message: err.message });
