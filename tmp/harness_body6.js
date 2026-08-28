@@ -84,7 +84,6 @@
 // use IBM Plex Mono / IBM Plex Sans as their primary — swapped in from
 // Montserrat / League Gothic) fall back to Open Sans instead.
 
-figma.showUI(__html__, { width: 360, height: 520 });
 
 const SECTION_GAP = 450; // horizontal gap between multiple collection Sections
 const MARGIN = 100; // margin between a Section's edge and its content frame
@@ -1301,25 +1300,3 @@ async function listCollectionTree() {
   return tree;
 }
 
-figma.ui.onmessage = async (msg) => {
-  if (msg.type === "ui-ready") {
-    try {
-      const collections = await listCollectionTree();
-      figma.ui.postMessage({ type: "tree", collections });
-    } catch (err) {
-      figma.ui.postMessage({ type: "error", message: err.message });
-    }
-  } else if (msg.type === "generate") {
-    const hasAnySelection = msg.selection && Object.values(msg.selection).some((groups) => groups && groups.length);
-    if (!hasAnySelection) {
-      figma.ui.postMessage({ type: "error", message: "Select at least one collection." });
-      return;
-    }
-    try {
-      const result = await generateSelected(msg.selection);
-      figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on the Style Guide page." });
-    } catch (err) {
-      figma.ui.postMessage({ type: "error", message: err.message });
-    }
-  }
-};
