@@ -307,6 +307,22 @@ function shadeSortKey(shade) {
   return Number.isNaN(n) ? shade : n;
 }
 
+// Comparator over two variables' trailing names: numeric shades ascending
+// (white first, black last), anything else alphabetical.
+function compareShades(a, b) {
+  const ka = shadeSortKey(a.name.split("/").pop());
+  const kb = shadeSortKey(b.name.split("/").pop());
+  if (typeof ka === "number" && typeof kb === "number") return ka - kb;
+  return String(ka).localeCompare(String(kb));
+}
+
+// True when every variable's trailing name is a numeric step (or
+// white/black) — i.e. the group is a scale whose natural order is numeric,
+// not a list of named tokens.
+function isNumericScaleGroup(vars) {
+  return vars.every((v) => typeof shadeSortKey(v.name.split("/").pop()) === "number");
+}
+
 function tileLabel(variable, labelParts) {
   return variable.name.split("/").slice(labelParts.length).join("/");
 }
@@ -378,12 +394,10 @@ function discoverTokenGroups(vars) {
   }
   const result = [];
   for (const [groupPath, groupVars] of groups) {
-    groupVars.sort((a, b) => {
-      const ka = shadeSortKey(a.name.split("/").pop());
-      const kb = shadeSortKey(b.name.split("/").pop());
-      if (typeof ka === "number" && typeof kb === "number") return ka - kb;
-      return String(ka).localeCompare(String(kb));
-    });
+    // Only reorder a true numeric scale (4, 8, 12 ...). Named tokens
+    // (h1, h2-lg, body ...) keep the collection's own variable order — the
+    // one the Variables panel shows — instead of being alphabetized.
+    if (isNumericScaleGroup(groupVars)) groupVars.sort(compareShades);
     result.push({ labelParts: groupPath.split("/"), vars: groupVars });
   }
   return result;
@@ -1044,8 +1058,8 @@ async function buildSectionHeader(title, description) {
   header.appendChild(titleText);
 
   if (description) {
-    const descText = await makeText(description, FONTS.headerDesc, 24, PALETTE.headerCream, {
-      lineHeight: { unit: "PIXELS", value: 32 },
+    const descText = await makeText(description, FONTS.headerDesc, 40, PALETTE.headerCream, {
+      lineHeight: { unit: "PERCENT", value: 120 },
     });
     header.appendChild(descText);
   }
@@ -1293,10 +1307,17 @@ async function listCollectionTree() {
       allVars.push(await figma.variables.getVariableByIdAsync(id));
     }
     const modeId = collection.modes[0].modeId;
-    const colorGroups = discoverColorGroups(allVars, modeId).map((g) => g.labelParts.join(" / "));
-    const tokenGroups = discoverTokenGroups(allVars).map((g) => g.labelParts.join(" / "));
-    const groups = [...new Set([...colorGroups, ...tokenGroups])];
-    tree.push({ name: collection.name, groups });
+    // Variables per group label — a label can show up in both the color and
+    // token discovery, so counts accumulate. A Map keeps discovery order.
+    const counts = new Map();
+    for (const g of [...discoverColorGroups(allVars, modeId), ...discoverTokenGroups(allVars)]) {
+      const label = g.labelParts.join(" / ");
+      counts.set(label, (counts.get(label) || 0) + g.vars.length);
+    }
+    const groups = [...counts.keys()];
+    const groupCounts = {};
+    for (const [label, n] of counts) groupCounts[label] = n;
+    tree.push({ name: collection.name, groups, groupCounts });
   }
   return tree;
 }

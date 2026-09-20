@@ -76,12 +76,22 @@
       width: 14px;
       flex: none;
     }
+    /* Nested folder / group rows. Left padding is set inline per depth
+       (see INDENT_STEP in the script) so every level indents further right. */
     .group-row {
-      padding-left: 34px;
       background: #fcfcfd;
     }
     .group-row .label {
       color: #444;
+    }
+    /* "(n)" variable count after a collection / folder name — muted, and it
+       never shrinks, so a long name is what gets truncated. */
+    .row .count {
+      flex: none;
+      font-size: 11px;
+      font-weight: 400;
+      color: #999;
+      font-variant-numeric: tabular-nums;
     }
     .empty {
       padding: 12px 10px;
@@ -117,7 +127,7 @@
 </head>
 <body>
   <h2>Style Guide Generator</h2>
-  <p>Generates a Section per selected collection on the Style Guide page &mdash; a "Colors" Section for its color variables, a "Tokens" Section for everything else. Expand a collection to include or leave out specific groups. Re-running replaces each collection's previous Sections.</p>
+  <p>Generates a Section per selected collection on the Style Guide page &mdash; a "Colors" Section for its color variables, a "Tokens" Section for everything else. Expand a collection or folder to include or leave out specific groups. Re-running replaces each collection's previous Sections.</p>
 
   <div id="collections">
     <div class="empty">Loading collections&hellip;</div>
@@ -131,9 +141,40 @@
     const generateBtn = document.getElementById('generate');
     const statusEl = document.getElementById('status');
 
-    let tree = null; // [{ name, groups: [string, ...] }, ...]
+    const PATH_SEP = ' / ';      // how code.js joins a group's path segments into its label
+    const KEY_SEP = '\u0000';    // separates collection name from folder path in expand keys
+    const BASE_PAD = 10;         // left padding of a top-level (collection) row
+    const INDENT_STEP = 20;      // extra left padding per nesting level
+
+    // [{ name, groups: [label, ...], folderTree }, ...]. Each group label is a
+    // full folder path such as "tier1_color / color_palettes / pale_red".
+    let tree = null;
     let selection = null; // Map<collectionName, Set<groupLabel>>
-    const expanded = new Set(); // collection names currently expanded
+    // Expanded rows: a collection's name, or collectionName + KEY_SEP + folder path.
+    const expanded = new Set();
+
+    // Turns a flat list of group labels into a nested folder tree. Every node
+    // records `labels` — each group label at or beneath it — so a folder's
+    // checkbox can select / deselect everything under it in one go, and
+    // `count` — the total variables at or beneath it (groupCounts maps each
+    // group label to its own variable count).
+    function buildFolderTree(groups, groupCounts) {
+      const root = { children: new Map() };
+      for (const label of groups) {
+        let node = root;
+        let path = '';
+        for (const part of label.split(PATH_SEP)) {
+          path = path ? path + PATH_SEP + part : part;
+          if (!node.children.has(part)) {
+            node.children.set(part, { name: part, path, children: new Map(), labels: [], count: 0 });
+          }
+          node = node.children.get(part);
+          node.labels.push(label);
+          node.count += groupCounts[label] || 0;
+        }
+      }
+      return root;
+    }
 
     function selectAllGroups() {
       selection = new Map(tree.map((c) => [c.name, new Set(c.groups)]));
@@ -155,6 +196,91 @@
       cb.addEventListener('click', (e) => e.stopPropagation());
       cb.addEventListener('change', onChange);
       return cb;
+    }
+
+    function toggleExpanded(key) {
+      if (expanded.has(key)) expanded.delete(key);
+      else expanded.add(key);
+      render();
+    }
+
+    // One row of the tree — used for collections and for every nested folder.
+    // `labels` are all the group labels the row's checkbox controls: checked
+    // when all are selected, indeterminate when only some are.
+    function makeRow({ depth, name, title, count, labels, selSet, expandKey, hasChildren, extraClass }) {
+      const row = document.createElement('div');
+      row.className = 'row' + (extraClass ? ' ' + extraClass : '');
+      row.style.paddingLeft = (BASE_PAD + depth * INDENT_STEP) + 'px';
+
+      if (hasChildren) {
+        const caret = document.createElement('button');
+        caret.className = 'caret' + (expanded.has(expandKey) ? ' expanded' : '');
+        caret.textContent = '▶';
+        caret.onclick = (e) => {
+          e.stopPropagation();
+          toggleExpanded(expandKey);
+        };
+        row.appendChild(caret);
+      } else {
+        const spacer = document.createElement('span');
+        spacer.className = 'caret-spacer';
+        row.appendChild(spacer);
+      }
+
+      let selectedCount = 0;
+      for (const l of labels) if (selSet.has(l)) selectedCount++;
+
+      const cb = makeCheckbox(() => {
+        for (const l of labels) {
+          if (cb.checked) selSet.add(l);
+          else selSet.delete(l);
+        }
+        render();
+      });
+      cb.checked = labels.length > 0 && selectedCount === labels.length;
+      cb.indeterminate = selectedCount > 0 && selectedCount < labels.length;
+      row.appendChild(cb);
+
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = name;
+      label.title = title;
+      row.appendChild(label);
+
+      // "(n)" — how many variables sit in this collection / folder.
+      const countEl = document.createElement('span');
+      countEl.className = 'count';
+      countEl.textContent = '(' + count + ')';
+      row.appendChild(countEl);
+
+      row.onclick = () => {
+        if (hasChildren) toggleExpanded(expandKey);
+        else cb.click();
+      };
+      return row;
+    }
+
+    // Recursively renders a collection's folders. A node with children gets
+    // its own caret + tri-state checkbox; a node without is a plain group row.
+    function renderFolderNodes(collectionName, nodes, depth, selSet) {
+      for (const node of nodes.values()) {
+        const hasChildren = node.children.size > 0;
+        const expandKey = collectionName + KEY_SEP + node.path;
+        collectionsEl.appendChild(makeRow({
+          depth,
+          name: node.name,
+          title: node.path,
+          count: node.count,
+          labels: node.labels,
+          selSet,
+          expandKey,
+          hasChildren,
+          extraClass: 'group-row',
+        }));
+        if (hasChildren && expanded.has(expandKey)) {
+          renderFolderNodes(collectionName, node.children, depth + 1, selSet);
+        }
+      }
     }
 
     function render() {
@@ -194,77 +320,23 @@
       collectionsEl.appendChild(selectAllRow);
 
       for (const collection of tree) {
-        const groups = collection.groups;
         const selSet = selection.get(collection.name);
-        const hasChildren = groups.length > 1;
-        const isExpanded = expanded.has(collection.name);
+        const hasChildren = collection.groups.length > 1;
+        const expandKey = collection.name;
 
-        const row = document.createElement('div');
-        row.className = 'row';
+        collectionsEl.appendChild(makeRow({
+          depth: 0,
+          name: collection.name,
+          title: collection.name,
+          count: collection.count,
+          labels: collection.groups,
+          selSet,
+          expandKey,
+          hasChildren,
+        }));
 
-        if (hasChildren) {
-          const caret = document.createElement('button');
-          caret.className = 'caret' + (isExpanded ? ' expanded' : '');
-          caret.textContent = '▶';
-          caret.onclick = (e) => {
-            e.stopPropagation();
-            if (expanded.has(collection.name)) expanded.delete(collection.name);
-            else expanded.add(collection.name);
-            render();
-          };
-          row.appendChild(caret);
-        } else {
-          const spacer = document.createElement('span');
-          spacer.className = 'caret-spacer';
-          row.appendChild(spacer);
-        }
-
-        const cb = makeCheckbox(() => {
-          if (cb.checked) selection.set(collection.name, new Set(groups));
-          else selection.set(collection.name, new Set());
-          render();
-        });
-        cb.checked = groups.length > 0 && selSet.size === groups.length;
-        cb.indeterminate = selSet.size > 0 && selSet.size < groups.length;
-        row.appendChild(cb);
-
-        const label = document.createElement('span');
-        label.className = 'label';
-        label.textContent = collection.name;
-        row.appendChild(label);
-
-        row.onclick = () => {
-          if (hasChildren) {
-            if (expanded.has(collection.name)) expanded.delete(collection.name);
-            else expanded.add(collection.name);
-            render();
-          } else {
-            cb.click();
-          }
-        };
-        collectionsEl.appendChild(row);
-
-        if (hasChildren && isExpanded) {
-          for (const groupLabel of groups) {
-            const groupRow = document.createElement('div');
-            groupRow.className = 'row group-row';
-
-            const groupCb = makeCheckbox(() => {
-              if (groupCb.checked) selSet.add(groupLabel);
-              else selSet.delete(groupLabel);
-              render();
-            });
-            groupCb.checked = selSet.has(groupLabel);
-            groupRow.appendChild(groupCb);
-
-            const groupLabelEl = document.createElement('span');
-            groupLabelEl.className = 'label';
-            groupLabelEl.textContent = groupLabel;
-            groupRow.appendChild(groupLabelEl);
-
-            groupRow.onclick = () => groupCb.click();
-            collectionsEl.appendChild(groupRow);
-          }
+        if (hasChildren && expanded.has(expandKey)) {
+          renderFolderNodes(collection.name, collection.folderTree.children, 1, selSet);
         }
       }
 
@@ -286,6 +358,11 @@
       if (!msg) return;
       if (msg.type === 'tree') {
         tree = msg.collections;
+        for (const c of tree) {
+          c.groupCounts = c.groupCounts || {};
+          c.folderTree = buildFolderTree(c.groups, c.groupCounts);
+          c.count = c.groups.reduce((sum, label) => sum + (c.groupCounts[label] || 0), 0);
+        }
         selectAllGroups();
         render();
       } else if (msg.type === 'success' || msg.type === 'error') {
