@@ -98,8 +98,13 @@
       font-size: 11px;
       color: #999;
     }
+    #actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
     button#generate {
-      width: 100%;
+      flex: 1;
       background: #18a0fb;
       color: white;
       border: none;
@@ -115,6 +120,27 @@
     button#generate:disabled {
       background: #b8dffb;
       cursor: not-allowed;
+    }
+    button#cancel {
+      background: #fff;
+      color: #1a1a1a;
+      border: 1px solid #d0d0d0;
+      border-radius: 6px;
+      padding: 10px 16px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button#cancel:hover {
+      background: #f5f5f5;
+    }
+    button#cancel:disabled {
+      color: #999;
+      background: #fafafa;
+      cursor: not-allowed;
+    }
+    button#cancel[hidden] {
+      display: none;
     }
     #status {
       margin-top: 12px;
@@ -133,12 +159,16 @@
     <div class="empty">Loading collections&hellip;</div>
   </div>
 
-  <button id="generate" disabled>Generate</button>
+  <div id="actions">
+    <button id="generate" disabled>Generate</button>
+    <button id="cancel" hidden>Cancel</button>
+  </div>
   <div id="status"></div>
 
   <script>
     const collectionsEl = document.getElementById('collections');
     const generateBtn = document.getElementById('generate');
+    const cancelBtn = document.getElementById('cancel');
     const statusEl = document.getElementById('status');
 
     const PATH_SEP = ' / ';      // how code.js joins a group's path segments into its label
@@ -340,8 +370,29 @@
         }
       }
 
-      generateBtn.disabled = totalSelectedCount() === 0;
+      generateBtn.disabled = isGenerating || totalSelectedCount() === 0;
     }
+
+    let isGenerating = false;
+
+    // While a run is in progress Generate is disabled and relabelled, and
+    // Cancel is shown; both go back to normal when the run ends.
+    function setGenerating(on) {
+      isGenerating = on;
+      generateBtn.textContent = on ? 'Generating…' : 'Generate';
+      generateBtn.disabled = on || !tree || !selection || totalSelectedCount() === 0;
+      cancelBtn.hidden = !on;
+      cancelBtn.disabled = false;
+      cancelBtn.textContent = 'Cancel';
+    }
+
+    cancelBtn.onclick = () => {
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = 'Cancelling…';
+      statusEl.className = '';
+      statusEl.textContent = 'Cancelling — finishing the group in progress…';
+      parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');
+    };
 
     generateBtn.onclick = () => {
       const payload = {};
@@ -350,6 +401,7 @@
       }
       statusEl.className = '';
       statusEl.textContent = 'Generating…';
+      setGenerating(true);
       parent.postMessage({ pluginMessage: { type: 'generate', selection: payload } }, '*');
     };
 
@@ -365,8 +417,12 @@
         }
         selectAllGroups();
         render();
-      } else if (msg.type === 'success' || msg.type === 'error') {
-        statusEl.className = msg.type;
+      } else if (msg.type === 'progress') {
+        // don't overwrite the "Cancelling…" note once Cancel has been pressed
+        if (isGenerating && !cancelBtn.disabled) statusEl.textContent = msg.message;
+      } else if (msg.type === 'success' || msg.type === 'error' || msg.type === 'cancelled') {
+        setGenerating(false);
+        statusEl.className = msg.type === 'cancelled' ? '' : msg.type;
         statusEl.textContent = msg.message;
       }
     };

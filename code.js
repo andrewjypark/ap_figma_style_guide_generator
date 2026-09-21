@@ -84,7 +84,7 @@
 // use IBM Plex Mono / IBM Plex Sans as their primary — swapped in from
 // Montserrat / League Gothic) fall back to Open Sans instead.
 
-figma.showUI(__html__, { width: 360, height: 520 });
+figma.showUI(__html__, { width: 360, height: 660 });
 
 const SECTION_GAP = 450; // horizontal gap between multiple collection Sections
 const MARGIN = 100; // margin between a Section's edge and its content frame
@@ -1108,53 +1108,135 @@ async function buildOutputSection(sectionLabel, headerTitle, headerDescription, 
     existingSection.remove();
   }
 
-  const wrapper = figma.createFrame();
-  wrapper.name = "collection_" + sectionLabel;
-  wrapper.layoutMode = "VERTICAL";
-  wrapper.primaryAxisSizingMode = "AUTO";
-  wrapper.counterAxisSizingMode = "FIXED";
-  wrapper.itemSpacing = 0;
-  wrapper.fills = [{ type: "SOLID", color: PALETTE.white }];
+  // Everything from here on is built as loose frames on the page until it
+  // is finally moved into the Section, so if anything throws part-way
+  // (a font that won't load, a Figma API error) remove what was made
+  // instead of leaving orphaned frames stranded on the page.
+  let wrapper = null;
+  let section = null;
+  try {
+    wrapper = figma.createFrame();
+    wrapper.name = "collection_" + sectionLabel;
+    wrapper.layoutMode = "VERTICAL";
+    wrapper.primaryAxisSizingMode = "AUTO";
+    wrapper.counterAxisSizingMode = "FIXED";
+    wrapper.itemSpacing = 0;
+    wrapper.fills = [{ type: "SOLID", color: PALETTE.white }];
 
-  wrapper.appendChild(await buildSectionHeader(headerTitle, headerDescription));
+    wrapper.appendChild(await buildSectionHeader(headerTitle, headerDescription));
 
-  for (const groupSection of groupSections) {
-    wrapper.appendChild(groupSection);
-  }
+    for (const groupSection of groupSections) {
+      wrapper.appendChild(groupSection);
+    }
 
-  wrapper.counterAxisSizingMode = "AUTO";
-  for (const child of wrapper.children) {
-    if (child.name === ".section-header") child.layoutSizingHorizontal = "FILL";
-  }
+    wrapper.counterAxisSizingMode = "AUTO";
+    for (const child of wrapper.children) {
+      if (child.name === ".section-header") child.layoutSizingHorizontal = "FILL";
+    }
 
-  const section = figma.createSection();
-  section.name = sectionLabel;
-  section.fills = [{ type: "SOLID", opacity: 1, color: PALETTE.sectionBg }];
-  outputPage.appendChild(section);
-  section.appendChild(wrapper);
-  wrapper.x = MARGIN;
-  wrapper.y = MARGIN;
-  resizeSectionToFit(section);
-  section.x = xOffset;
-  section.y = 0;
+    section = figma.createSection();
+    section.name = sectionLabel;
+    section.fills = [{ type: "SOLID", opacity: 1, color: PALETTE.sectionBg }];
+    outputPage.appendChild(section);
+    section.appendChild(wrapper);
+    wrapper.x = MARGIN;
+    wrapper.y = MARGIN;
+    resizeSectionToFit(section);
+    section.x = xOffset;
+    section.y = 0;
 
-  if (modeName) {
-    const matchingMode = collection.modes.find((m) => m.name === modeName);
-    if (matchingMode) {
-      try {
-        section.setExplicitVariableModeForCollection(collection, matchingMode.modeId);
-      } catch (e) {
-        // this collection doesn't support an override here; skip
+    if (modeName) {
+      const matchingMode = collection.modes.find((m) => m.name === modeName);
+      if (matchingMode) {
+        try {
+          section.setExplicitVariableModeForCollection(collection, matchingMode.modeId);
+        } catch (e) {
+          // this collection doesn't support an override here; skip
+        }
       }
     }
-  }
 
-  return section;
+    return section;
+  } catch (err) {
+    for (const node of [section, wrapper, ...groupSections]) {
+      try {
+        if (node) node.remove();
+      } catch (e) {
+        // already removed along with its parent
+      }
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------
+// GROUP ORDER — a section's groups are kept next to the other groups from
+// the same top-level folder. It only looks at each group's path, never at
+// what anything is called, so it behaves the same on every collection.
+// ---------------------------------------------------------------------
+
+// Puts groups that share a top-level folder next to each other, keeping the
+// folders in first-appearance order and each folder's groups in their
+// existing order. A no-op when the groups already come out contiguous.
+function clusterByTopFolder(groups) {
+  const order = [];
+  const buckets = new Map();
+  for (const g of groups) {
+    const top = g.labelParts[0];
+    if (!buckets.has(top)) {
+      buckets.set(top, []);
+      order.push(top);
+    }
+    buckets.get(top).push(g);
+  }
+  const out = [];
+  for (const top of order) for (const g of buckets.get(top)) out.push(g);
+  return out;
 }
 
 // ---------------------------------------------------------------------
 // TOP-LEVEL GENERATION
 // ---------------------------------------------------------------------
+
+// Cancellation. The UI's Cancel button posts a "cancel" message, which the
+// message handler turns into `cancelRequested`. The generator only notices
+// it at checkpoint() — called before each group is built, so a cancel lands
+// within one group's build time and never leaves a half-built frame behind.
+let isGenerating = false;
+let cancelRequested = false;
+
+function makeCancelledError() {
+  const err = new Error("Cancelled");
+  err.cancelled = true;
+  return err;
+}
+
+// Reports progress to the UI, yields to the event loop so a pending "cancel"
+// message can actually be delivered (awaiting an already-resolved promise
+// wouldn't), then throws if one arrived. Call with no arguments to just
+// check for a cancel.
+async function checkpoint(label, done, total) {
+  if (label) {
+    figma.ui.postMessage({
+      type: "progress",
+      message: "Building " + label + " — group " + (done + 1) + " of " + total + "…",
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (cancelRequested) throw makeCancelledError();
+}
+
+// Removes group frames that were built for a Section that never got
+// finished (cancelled or errored), so they don't linger on the page.
+function discardGroupFrames(nodes) {
+  for (const n of nodes) {
+    try {
+      n.remove();
+    } catch (err) {
+      // already gone
+    }
+  }
+}
 
 async function generateForCollectionMode(collection, modeId, modeName, xCursor, outputPage, selectedGroupLabels) {
   const allVars = [];
@@ -1170,8 +1252,10 @@ async function generateForCollectionMode(collection, modeId, modeName, xCursor, 
   // sees every variable in the collection regardless of what's selected —
   // deselecting "Line height" shouldn't degrade a still-selected "Font
   // Size" style's composed sample, which needs that sibling's value.
-  const colorGroups = discoverColorGroups(allVars, modeId).filter(
-    (g) => !selectedGroupLabels || selectedGroupLabels.has(g.labelParts.join(" / "))
+  const colorGroups = clusterByTopFolder(
+    discoverColorGroups(allVars, modeId).filter(
+      (g) => !selectedGroupLabels || selectedGroupLabels.has(g.labelParts.join(" / "))
+    )
   );
   const tokenGroups = discoverTokenGroups(allVars).filter(
     (g) => !selectedGroupLabels || selectedGroupLabels.has(g.labelParts.join(" / "))
@@ -1182,8 +1266,14 @@ async function generateForCollectionMode(collection, modeId, modeName, xCursor, 
 
   if (colorGroups.length) {
     const groupSections = [];
-    for (const g of colorGroups) {
-      if (g.vars.length) groupSections.push(await buildColorGroupSection(g, modeId));
+    try {
+      for (const g of colorGroups) {
+        await checkpoint(baseLabel + " — Colors", groupSections.length, colorGroups.length);
+        if (g.vars.length) groupSections.push(await buildColorGroupSection(g, modeId));
+      }
+    } catch (err) {
+      discardGroupFrames(groupSections);
+      throw err;
     }
     const section = await buildOutputSection(
       baseLabel + " — Colors",
@@ -1201,14 +1291,26 @@ async function generateForCollectionMode(collection, modeId, modeName, xCursor, 
   }
 
   if (tokenGroups.length) {
-    const groupSections = [];
     const siblingIndex = buildTokenSiblingIndex(allVars);
     const consumedIds = computeConsumedSiblingIds(allVars, siblingIndex);
+    // Only lay out groups that still have cards to draw (a variable folded
+    // into a composed type-style card doesn't get its own).
+    const visibleGroups = [];
     for (const g of tokenGroups) {
       const visibleVars = g.vars.filter((v) => !consumedIds.has(v.id));
-      if (visibleVars.length) {
-        groupSections.push(await buildTokenGroupSection({ labelParts: g.labelParts, vars: visibleVars }, modeId, siblingIndex));
+      if (visibleVars.length) visibleGroups.push({ labelParts: g.labelParts, vars: visibleVars });
+    }
+    const groupSections = [];
+    const arranged = clusterByTopFolder(visibleGroups);
+    try {
+      for (const g of arranged) {
+        await checkpoint(baseLabel + " — Tokens", groupSections.length, arranged.length);
+        groupSections.push(await buildTokenGroupSection(g, modeId, siblingIndex));
       }
+    } catch (err) {
+      discardGroupFrames(groupSections);
+      if (err && err.cancelled) err.partialSections = created;
+      throw err;
     }
     const section = await buildOutputSection(
       baseLabel + " — Tokens",
@@ -1245,29 +1347,41 @@ async function generateSelected(selection) {
 
   let xCursor = 0;
   const createdSections = [];
-  for (const name of orderedNames) {
-    const groupLabels = selection[name];
-    if (!groupLabels || !groupLabels.length) continue;
-    const collection = allCollections.find((c) => c.name === name);
-    if (!collection) continue;
-    const selectedGroupLabels = new Set(groupLabels);
-    const modes = collection.modes;
+  let cancelled = false;
+  try {
+    for (const name of orderedNames) {
+      await checkpoint();
+      const groupLabels = selection[name];
+      if (!groupLabels || !groupLabels.length) continue;
+      const collection = allCollections.find((c) => c.name === name);
+      if (!collection) continue;
+      const selectedGroupLabels = new Set(groupLabels);
+      const modes = collection.modes;
 
-    if (modes.length <= 1) {
-      const { created, xCursor: next } = await generateForCollectionMode(
-        collection, modes[0].modeId, null, xCursor, outputPage, selectedGroupLabels
-      );
-      createdSections.push(...created);
-      xCursor = next;
-    } else {
-      for (const mode of modes) {
+      if (modes.length <= 1) {
         const { created, xCursor: next } = await generateForCollectionMode(
-          collection, mode.modeId, mode.name, xCursor, outputPage, selectedGroupLabels
+          collection, modes[0].modeId, null, xCursor, outputPage, selectedGroupLabels
         );
         createdSections.push(...created);
         xCursor = next;
+      } else {
+        for (const mode of modes) {
+          const { created, xCursor: next } = await generateForCollectionMode(
+            collection, mode.modeId, mode.name, xCursor, outputPage, selectedGroupLabels
+          );
+          createdSections.push(...created);
+          xCursor = next;
+        }
       }
     }
+  } catch (err) {
+    // A cancel keeps every section that was already finished (a section is
+    // only ever added to the page once it's complete); anything else is a
+    // real error and goes on up.
+    if (!err || !err.cancelled) throw err;
+    // e.g. a collection's Colors Section finished before its Tokens were cancelled
+    if (err.partialSections) createdSections.push(...err.partialSections);
+    cancelled = true;
   }
 
   // Belt-and-suspenders re-fit: buildOutputSection already calls
@@ -1282,10 +1396,12 @@ async function generateSelected(selection) {
   for (const section of createdSections) resizeSectionToFit(section);
   reflowSections(outputPage);
 
-  figma.currentPage.selection = createdSections;
-  figma.viewport.scrollAndZoomIntoView(createdSections);
+  if (createdSections.length) {
+    figma.currentPage.selection = createdSections;
+    figma.viewport.scrollAndZoomIntoView(createdSections);
+  }
 
-  return { sectionCount: createdSections.length };
+  return { sectionCount: createdSections.length, cancelled };
 }
 
 // Builds the tree the UI's checkbox picker is drawn from: one row per
@@ -1330,17 +1446,38 @@ figma.ui.onmessage = async (msg) => {
     } catch (err) {
       figma.ui.postMessage({ type: "error", message: err.message });
     }
+  } else if (msg.type === "cancel") {
+    // Takes effect at the generator's next checkpoint (between groups) — see checkpoint().
+    if (isGenerating) cancelRequested = true;
   } else if (msg.type === "generate") {
+    if (isGenerating) {
+      figma.ui.postMessage({ type: "error", message: "Already generating — cancel that run first." });
+      return;
+    }
     const hasAnySelection = msg.selection && Object.values(msg.selection).some((groups) => groups && groups.length);
     if (!hasAnySelection) {
       figma.ui.postMessage({ type: "error", message: "Select at least one collection." });
       return;
     }
+    isGenerating = true;
+    cancelRequested = false;
     try {
       const result = await generateSelected(msg.selection);
-      figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on the Style Guide page." });
+      if (result.cancelled) {
+        figma.ui.postMessage({
+          type: "cancelled",
+          message: result.sectionCount
+            ? "Cancelled. " + result.sectionCount + " section(s) had already been generated and were kept."
+            : "Cancelled. No sections were changed.",
+        });
+      } else {
+        figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on the Style Guide page." });
+      }
     } catch (err) {
       figma.ui.postMessage({ type: "error", message: err.message });
+    } finally {
+      isGenerating = false;
+      cancelRequested = false;
     }
   }
 };
