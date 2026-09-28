@@ -1,11 +1,13 @@
 // AP Style Guide Generator
 //
-// Generates a Section per selected variable collection on a "Style Guide"
-// page, built entirely from primitives (frames/rectangles/text) rather than
-// by cloning pre-existing master components from elsewhere in the file.
-// This means the plugin is fully self-contained: it works in ANY Figma
-// file, for any account, with no setup step (no internal components to
-// copy in, no shared library to subscribe to).
+// Generates a Section per selected variable collection on a fresh page
+// created for each run (named "AP Style Guide", or "AP Style Guide_1",
+// "AP Style Guide_2", etc. if that name is already taken), built entirely
+// from primitives (frames/rectangles/text) rather than by cloning
+// pre-existing master components from elsewhere in the file. This means
+// the plugin is fully self-contained: it works in ANY Figma file, for any
+// account, with no setup step (no internal components to copy in, no
+// shared library to subscribe to).
 //
 // COLLECTIONS: every local variable collection is offered, regardless of
 // naming convention. A collection is inspected by what it actually
@@ -1238,11 +1240,12 @@ function discardGroupFrames(nodes) {
   }
 }
 
-async function generateForCollectionMode(collection, modeId, modeName, xCursor, outputPage, selectedGroupLabels) {
-  const allVars = [];
-  for (const id of collection.variableIds) {
-    allVars.push(await figma.variables.getVariableByIdAsync(id));
-  }
+async function generateForCollectionMode(collection, allVars, modeId, modeName, xCursor, outputPage, selectedGroupLabels) {
+  // allVars is this collection's variables, fetched once by the caller
+  // (generateSelected) and reused across every mode of this collection —
+  // resolved values differ per mode, but the variable objects themselves
+  // don't, so refetching them here (and doing it one at a time) was pure
+  // waste, worse the more modes a collection has.
 
   // selectedGroupLabels is the set of "labelParts.join(' / ')" strings the
   // UI's checkbox tree left checked for this collection — null means no
@@ -1334,12 +1337,18 @@ async function generateForCollectionMode(collection, modeId, modeName, xCursor, 
 // exactly the shape the UI's checkbox tree sends — a collection missing
 // from it, or present with an empty array, is skipped entirely.
 async function generateSelected(selection) {
-  let outputPage = figma.root.children.find((p) => p.name === "Style Guide");
-  if (!outputPage) {
-    outputPage = figma.createPage();
-    outputPage.name = "Style Guide";
+  // Every run gets its own brand-new page, so nothing here ever touches a
+  // page you've already arranged. If the base name is taken (by a previous
+  // run, or anything else in the file), fall back to "_1", "_2", etc.
+  const PAGE_BASE_NAME = "AP Style Guide";
+  const existingPageNames = new Set(figma.root.children.map((p) => p.name));
+  let pageName = PAGE_BASE_NAME;
+  for (let i = 1; existingPageNames.has(pageName); i++) {
+    pageName = PAGE_BASE_NAME + "_" + i;
   }
-  await outputPage.loadAsync();
+  const outputPage = figma.createPage();
+  outputPage.name = pageName;
+  outputPage.backgrounds = [{ type: "SOLID", color: hexToRgb("#CFCFCF") }];
   await figma.setCurrentPageAsync(outputPage);
 
   const orderedNames = Object.keys(selection).sort(compareCollections);
@@ -1357,17 +1366,22 @@ async function generateSelected(selection) {
       if (!collection) continue;
       const selectedGroupLabels = new Set(groupLabels);
       const modes = collection.modes;
+      // Fetched once per collection (not once per mode, and not one
+      // variable at a time) — see generateForCollectionMode.
+      const allVars = await Promise.all(
+        collection.variableIds.map((id) => figma.variables.getVariableByIdAsync(id))
+      );
 
       if (modes.length <= 1) {
         const { created, xCursor: next } = await generateForCollectionMode(
-          collection, modes[0].modeId, null, xCursor, outputPage, selectedGroupLabels
+          collection, allVars, modes[0].modeId, null, xCursor, outputPage, selectedGroupLabels
         );
         createdSections.push(...created);
         xCursor = next;
       } else {
         for (const mode of modes) {
           const { created, xCursor: next } = await generateForCollectionMode(
-            collection, mode.modeId, mode.name, xCursor, outputPage, selectedGroupLabels
+            collection, allVars, mode.modeId, mode.name, xCursor, outputPage, selectedGroupLabels
           );
           createdSections.push(...created);
           xCursor = next;
@@ -1401,7 +1415,7 @@ async function generateSelected(selection) {
     figma.viewport.scrollAndZoomIntoView(createdSections);
   }
 
-  return { sectionCount: createdSections.length, cancelled };
+  return { sectionCount: createdSections.length, cancelled, pageName: outputPage.name };
 }
 
 // Builds the tree the UI's checkbox picker is drawn from: one row per
@@ -1418,10 +1432,9 @@ async function listCollectionTree() {
   const ordered = [...collections].sort((a, b) => compareCollections(a.name, b.name));
   const tree = [];
   for (const collection of ordered) {
-    const allVars = [];
-    for (const id of collection.variableIds) {
-      allVars.push(await figma.variables.getVariableByIdAsync(id));
-    }
+    const allVars = await Promise.all(
+      collection.variableIds.map((id) => figma.variables.getVariableByIdAsync(id))
+    );
     const modeId = collection.modes[0].modeId;
     // Variables per group label — a label can show up in both the color and
     // token discovery, so counts accumulate. A Map keeps discovery order.
@@ -1471,7 +1484,7 @@ figma.ui.onmessage = async (msg) => {
             : "Cancelled. No sections were changed.",
         });
       } else {
-        figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on the Style Guide page." });
+        figma.ui.postMessage({ type: "success", message: "Generated " + result.sectionCount + " section(s) on a new \"" + result.pageName + "\" page." });
       }
     } catch (err) {
       figma.ui.postMessage({ type: "error", message: err.message });
